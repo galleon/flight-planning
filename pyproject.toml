@@ -1,0 +1,21 @@
+[tool.poetry]
+name = "flight-planning"
+version = "0.1.0"
+description = ""
+authors = [
+    "Guillaume Alleon <guillaume.alleon@gmail.com>",
+]
+
+[tool.poetry.dependencies]
+casadi = "^3.5.5"
+python = "^3.8"
+python-dotenv = "^0.20.0"
+pygeodesy = "^22.4.22"
+
+[tool.poetry.dev-dependencies]
+black = "^22.1.0"
+isort = "^5.10.1"
+
+[build-system]
+requires = ["poetry-core>=1.0.0"]
+build-backend = "poetry.core.masonry.api"
