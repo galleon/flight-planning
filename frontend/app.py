@@ -2,6 +2,8 @@ import streamlit as st
 
 from streamlit_folium import st_folium
 import folium
+import time
+import pandas as pd
 
 from pygeodesy import geohash
 from pygeodesy.ellipsoidalVincenty import LatLon
@@ -148,7 +150,9 @@ if city1 != city2 and np % 2 == 1 and nc % 2 == 1:
                 fill_color="#3186cc",
             ).add_to(m)
 
-    position = [0, 0]
+    if "position" not in locals():
+        position = [0, 0]
+
     aircraft_location = pt[position[0]][position[1]]
     aircraft_marker = folium.Marker(
         location=[aircraft_location.lat, aircraft_location.lon],
@@ -156,6 +160,8 @@ if city1 != city2 and np % 2 == 1 and nc % 2 == 1:
     )
 
     aircraft_marker.add_to(m)
+
+    st_data = st.empty()
 
     while position[0] < np - 1:
         # get the next posible state
@@ -173,5 +179,5 @@ if city1 != city2 and np % 2 == 1 and nc % 2 == 1:
             pt[position[0]][position[1]].lat,
             pt[position[0]][position[1]].lon,
         ]
-
+        time.sleep(0.5)
         st_data = st_folium(m, width=800, height=500)
