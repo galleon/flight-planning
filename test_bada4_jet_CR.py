@@ -1,5 +1,6 @@
 from pybada.bada4 import BADA4_jet_CR, Table
 
+print("BOOM !!!")
 
 aircraft = BADA4_jet_CR("A330-341")
 
@@ -12,6 +13,8 @@ try:
     aircraft.best_mach(10.0, 10.0)
 except Exception as e:
     assert e.__class__.__name__ == "ValueError"
+    print("BADA BOOM !!!")
+
 
 assert aircraft.best_mach(-0.000522, 1.323543) == 0.500453
 

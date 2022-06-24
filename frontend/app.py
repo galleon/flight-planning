@@ -25,41 +25,8 @@ def city_to_lat_lon(city):
         return LatLon(43.6044, 1.4436)
 
 
-c1, c2 = st.sidebar.columns(2)
-city_list1 = ["Paris", "New York", "Tokyo", "London", "Toulouse"]
-city1 = c1.selectbox("City pair", city_list1)
-
-city_list2 = [city for city in city_list1 if city != city1]
-city2 = c2.selectbox("", city_list2)
-
-date = st.sidebar.date_input("Date", value=pd.Timestamp("2020-01-01"))
-aircraft = st.sidebar.selectbox("Aircraft", ("A320", "A380"))
-
-p0 = city_to_lat_lon(city1)
-p1 = city_to_lat_lon(city2)
-
-dist_p0top1 = p0.distanceTo(p1)
-
-np0 = int(dist_p0top1 / 100000)
-if np0 % 2 == 0:
-    np0 += 1
-
-np0 = max(11, np0)
-
-np_min = np0 - 8
-np_max = np0 + 8
-
-nc0 = 11
-
-nc_min = nc0 - 8
-mc_max = nc0 + 8
-
-np: int = st.sidebar.slider("Number of trajectory points", np_min, np_max, value=np0)
-nc: int = st.sidebar.slider("Number of side points", 3, 50, value=nc0)
-
-distp = 10 * dist_p0top1 / np / nc  # meters
-
-if city1 != city2 and np % 2 == 1 and nc % 2 == 1:
+@st.cache
+def get_data(p0, p1, np: int, nc: int):
     np2 = np // 2
     nc2 = nc // 2
 
@@ -116,6 +83,45 @@ if city1 != city2 and np % 2 == 1 and nc % 2 == 1:
             pt[np2 + i][nc2 - j] = pt[np2 + i - 1][nc2 - j].destination(
                 total_distance / (np2 - i + 1), bearing
             )
+    return pt
+
+
+c1, c2 = st.sidebar.columns(2)
+city_list1 = ["Paris", "New York", "Tokyo", "London", "Toulouse"]
+city1 = c1.selectbox("City pair", city_list1)
+
+city_list2 = [city for city in city_list1 if city != city1]
+city2 = c2.selectbox("", city_list2)
+
+date = st.sidebar.date_input("Date", value=pd.Timestamp("2020-01-01"))
+aircraft = st.sidebar.selectbox("Aircraft", ("A320", "A380"))
+
+p0 = city_to_lat_lon(city1)
+p1 = city_to_lat_lon(city2)
+
+dist_p0top1 = p0.distanceTo(p1)
+
+np0 = int(dist_p0top1 / 100000)
+if np0 % 2 == 0:
+    np0 += 1
+
+np0 = max(11, np0)
+
+np_min = np0 - 8
+np_max = np0 + 8
+
+nc0 = 11
+
+nc_min = nc0 - 8
+mc_max = nc0 + 8
+
+np: int = st.sidebar.slider("Number of trajectory points", np_min, np_max, value=np0)
+nc: int = st.sidebar.slider("Number of side points", 3, 50, value=nc0)
+
+distp = 10 * dist_p0top1 / np / nc  # meters
+
+if city1 != city2 and np % 2 == 1 and nc % 2 == 1:
+    pt = get_data(p0, p1, np, nc)
 
     sw = (
         min(pt[i][j].lat for i in range(np) for j in range(nc)),
@@ -127,7 +133,7 @@ if city1 != city2 and np % 2 == 1 and nc % 2 == 1:
     )
 
     m = folium.Map(
-        location=[pt[np2][nc2].lat, pt[np2][nc2].lon]
+        location=[pt[np // 2][nc // 2].lat, pt[np // 2][nc // 2].lon]
     )  # , tiles="Stamen Terrain")
 
     m.fit_bounds([sw, ne])
@@ -136,7 +142,7 @@ if city1 != city2 and np % 2 == 1 and nc % 2 == 1:
         line = []
         for i in range(np):
             line.append([pt[i][j].lat, pt[i][j].lon])
-        color = "darkred" if j == nc2 else "yellow"
+        color = "darkred" if j == nc // 2 else "yellow"
         folium.PolyLine(locations=line, color=color, no_clip=True).add_to(m)
 
     for j in range(nc):
