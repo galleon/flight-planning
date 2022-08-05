@@ -44,6 +44,24 @@ class WeatherModel(object):
             aircraft_position.lon,
         )
 
+    def get_temperature(self, aircraft_position: AircraftPosition):
+        #
+        # Get the wind speed from the GFS
+        current_datetime = self.dof + timedelta(seconds=aircraft_position.t)
+
+        date_str = current_datetime.strftime("%Y%m%d %H:%M:%S")
+
+        print(
+            f"date_str: {date_str} <lat, lon>: {aircraft_position.lat, aircraft_position.lon}"
+        )
+
+        res = self.f.get(
+            ["tmptrop"],
+            date_str,
+            aircraft_position.lat,
+            aircraft_position.lon,
+        )
+
 
 if __name__ == "__main__":
     now = datetime.now()

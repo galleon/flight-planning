@@ -37,7 +37,8 @@ class AircraftPosition(object):
     def __init__(self, latitude, longitude, Hp, t):
         self.lat = latitude
         self.lon = longitude
-        self.Hp = Hp  # MSL height also called geopotential altitude (FL)
+        # self.Hp = Hp  # MSL height also called geopotential altitude (FL)
+        self.alt = Hp  # Altitude above MSL
         self.t = t
 
     @classmethod
@@ -141,7 +142,7 @@ class ISA(object):
     def get_environment_state(
         self, aircraft_position: AircraftPosition
     ) -> EnvironmentState:
-        z = aircraft_position.Hp
+        z = aircraft_position.alt
         P = self.IP(z)
         T = self.IT(z)
         return EnvironmentState(P, T)

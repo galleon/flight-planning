@@ -1,11 +1,12 @@
+import random as rnd
 import sys
 from argparse import Action
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-import random as rnd
 from typing import List, Tuple
 
 import networkx as nx
+import openap.top as otop
 from openlocationcode import openlocationcode as olc
 from pygeodesy import geohash
 from pygeodesy.ellipsoidalVincenty import LatLon
@@ -17,13 +18,9 @@ from pybada.bada4 import (
     BADA4_jet_CR,
     ControlLaws,
     EnvironmentState,
-    g,
     ft2m,
+    g,
 )
-
-from pygeodesy.ellipsoidalVincenty import LatLon
-
-
 from weather.weather import WeatherModel
 
 
@@ -102,6 +99,10 @@ def get_data(p0: LatLon, p1: LatLon, np: int, nc: int):
     return pt
 
 
+def get_cost(state: State, action: State):
+    return state.aircraft_position.distanceTo(action.aircraft_position)
+
+
 class FlightPlanningDomain(object):
     def __init__(
         self,
@@ -136,46 +137,43 @@ class FlightPlanningDomain(object):
 
     def get_next_state(self, current_state: State, current_action: Action) -> State:
 
-        u_wind, v_wind = self.weather_env.get_wind_speed(
-            current_state.aircraft_position
-        )
+        uv_wind = self.weather_model.get_wind_speed(current_state.aircraft_position)
+
+        print(f"uv_wind: {uv_wind}")
 
         # Moving from point A (current_state) to point B (given by action)
 
         delta_t = 0.001
 
-        # if bada_transition_method == BadaTransitionMethod.V1_MANON_AIRBUS:
-        #    self.evaluate_function = badatransition_v1.evaluate_transition_bada
-        # if bada_transition_method == BadaTransitionMethod.V2_OBJECT_FREE_TRANSITION:
-        #    self.evaluate_function = badatransition_v2.evaluate_transition_badani
-        # if bada_transition_method == BadaTransitionMethod.V3_POPO:
-        #    self.evaluate_function = badatransition_v3.evaluate_transition_bada_objectless
-
         p0 = LatLon(
-            current_state.aircraft_position.latitude,
-            current_state.aircraft_position.longitude,
-            current_state.aircraft_position.altitude,
+            current_state.aircraft_position.lat,
+            current_state.aircraft_position.lon,
+            current_state.aircraft_position.alt,
         )
         p1 = LatLon(
-            current_action.aircraft_position.latitude,
-            current_action.aircraft_position.longitude,
-            current_action.aircraft_position.altitude,
+            current_action.aircraft_position.lat,
+            current_action.aircraft_position.lon,
+            current_action.aircraft_position.alt,
         )
 
         total_distance = p0.distanceTo(p1)
         course = p0.bearingTo(p1)
 
+        environment_state = ISA().get_environment_state(current_state.aircraft_position)
+
         if self.weather_model is not None:
             temperature = self.weather_model.get_temperature(
-                current_state.aircraft_position.altitude
+                current_state.aircraft_position
             )
         else:
             temperature = ISA().get_temperature(current_state.aircraft_position)
 
-        dh = (
-            current_action.aircraft_position.altitude
-            - current_state.aircraft_position.altitude
-        )
+        print(f"temperature: {temperature}")
+
+        dh = current_action.aircraft_position.alt - current_state.aircraft_position.alt
+
+        print(f"dh: {dh}")
+
         controls = None
         dvdh = 0
         if dh > 0:
@@ -197,20 +195,25 @@ class FlightPlanningDomain(object):
         v_dot = self.apm.v_dot(
             current_state.environment_state, current_state.aircraft_state, controls
         )
+
         m_dot = self.apm.m_dot(
             current_state.environment_state, current_state.aircraft_state, controls
         )
 
+        return v_dot, m_dot
+
     def is_terminal_state(self, state: State) -> bool:
         # Did we reach the end of the graph?
-        return state.node_id[0] == self.final_state.node_id[0]
+        print(f"State: {state.node_id}")
+        # print(f"{type(state.node_id)}")
+        return state.node_id[0] == self.final_state.node_id[0] - 1
 
     def get_next_available_actions(self, current_state: State) -> List[State]:
 
         print(f"State: {current_state}")
 
-        x0, y0 = initial_state.node_id
-        x1, y1 = final_state.node_id
+        x0, y0 = self.initial_state.node_id
+        x1, y1 = self.final_state.node_id
 
         x, y = current_state.node_id
 
@@ -285,7 +288,37 @@ class FlightPlanningDomain(object):
             best_altitude_m + delta_altitude,
         ]
 
-        print(next_nodes)
+        initial_position = LatLon(self.pt[x][y].lat, self.pt[x][y].lon, self.pt[x][y].alt)
+
+        for node in next_nodes:
+            for mach in machs:
+                for altitude in altitudes:
+                    # Let's compute the cost of this action
+                    print(
+                        f"tas: {true_air_speed}, heading: {heading}, flight_path_angle: {flight_path_angle}, mass: {mass}"
+                    )
+                    candidate_position = LatLon(self.pt[node[0]][node[1]].lat, self.pt[node[0]][node[1]].lon, altitude)
+
+                    current_position = candidate_position
+
+                    while current_position.distanceTo(candidate_position)> 1:
+                        print(f"not at destination")
+                        #
+                        heading = current_position.bearingTo(candidate_position)
+                        #
+
+
+
+                    # Integration et calcul de la vitesse
+                    while
+
+
+                    #
+
+
+                    #v_dot, m_dot = self.get_next_state(current_state, candidate_state)
+                    self.apm.get_fuel_burn_at_cruise_conditions(environment_state, aircraft_state)
+                    print(f"v_dot: {v_dot}, m_dot: {m_dot}")
 
         # create new states
         next_actions = [
@@ -301,6 +334,8 @@ class FlightPlanningDomain(object):
             for mach in machs
         ]
 
+        print(f"There is {len(next_actions)} actions to choose from")
+
         return next_actions
 
 
@@ -313,10 +348,21 @@ if __name__ == "__main__":
     np: int = 11  # number of points along a trajectory
     nc: int = 11  # number of trajectories
 
-    Hp = 10000  # m
+    altitude = 10000  # m
 
-    p0: LatLon = LatLon(*LFBO, Hp)
-    p1: LatLon = LatLon(*LFPO, Hp)
+    p0: LatLon = LatLon(*LFBO, altitude)
+    p1: LatLon = LatLon(*LFPO, altitude)
+
+    # Using OpenAP-TOP
+
+    optimizer = otop.CompleteFlight("A320", "LFBO", "LFPO", m0=0.85)
+
+    fgrib = "path_to_the_wind_data.grib"
+    windfield = otop.wind.read_grib(fgrib)
+    otop.enable_wind(windfield)
+
+    flight = optimizer.trajectory(objective="fuel")
+
 
     # Flying from LFBO to LFPO (see http://rfinder.asalink.net/free/)
     # ID      FREQ   TRK   DIST   Coords                       Name/Remarks
@@ -332,7 +378,7 @@ if __name__ == "__main__":
     aircraft = BADA4_jet_CR("A320-231")
 
     now = datetime.now() - timedelta(days=1)
-    print(f"Current date and time {now}")
+    print(f"Simulated date and time {now}")
 
     # Initial conditions
     # K[T|I|C]AS = Knots [True | Indicated | Calibrated] Air Speed
@@ -342,7 +388,7 @@ if __name__ == "__main__":
     mass = aircraft.MTOW * 0.8  # 80% of MTOW
 
     print(
-        f"Initial conditions:{p0.lat} {p0.lon} {p0.height} {true_air_speed} {heading} {flight_path_angle} {mass}"
+        f"Initial conditions: {p0.lat} {p0.lon} {p0.height} {true_air_speed} {heading} {flight_path_angle} {mass}"
     )
 
     initial_state = State(
@@ -350,6 +396,7 @@ if __name__ == "__main__":
         AircraftState(true_air_speed, heading, flight_path_angle, mass),
         (0, 0),
     )
+
     final_state = State(
         AircraftPosition(p1.lat, p1.lon, p1.height, None),
         AircraftState(0, 0, 0, 0),
@@ -385,8 +432,13 @@ if __name__ == "__main__":
             f"At time: {weather_model.dof + timedelta(seconds=current_state.aircraft_position.t)}"
         )
         print(
-            f"Aircraft position: {current_state.aircraft_position.lat:2.2f} {current_state.aircraft_position.lon:2.2f} {current_state.aircraft_position.Hp}"
+            f"Aircraft position: {current_state.aircraft_position.lat:2.2f} {current_state.aircraft_position.lon:2.2f} {current_state.aircraft_position.alt}"
         )
+
         actions = domain.get_next_available_actions(current_state)
 
-        actions = rnd.choices(actions, k=10)
+        action = rnd.choices(actions)
+
+        print(f"Choice is: {action}")
+
+        current_state = action[0]
