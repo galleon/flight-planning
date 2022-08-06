@@ -276,6 +276,4 @@ if __name__ == "__main__":
 
         current_state = domain.get_next_state(current_state, action)
 
-        print(f"Current state: {current_state}\n---------")
-
     current_state.trajectory.to_csv(f"data/trajectory_{origin}_{destination}.csv")
