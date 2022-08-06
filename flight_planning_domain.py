@@ -1,35 +1,15 @@
-import random as rnd
 import sys
+import warnings
+
 from argparse import Action
 from dataclasses import dataclass
-from datetime import datetime, timedelta
-from typing import List, Tuple
+from typing import List, Tuple, Union
 
-import networkx as nx
-import openap.top as otop
-from openlocationcode import openlocationcode as olc
-from pygeodesy import geohash
+import pandas as pd
+from openap.top import Climb, Cruise, Descent, wind
 from pygeodesy.ellipsoidalVincenty import LatLon
 
-from pybada.bada4 import (
-    ISA,
-    AircraftPosition,
-    AircraftState,
-    BADA4_jet_CR,
-    ControlLaws,
-    EnvironmentState,
-    ft2m,
-    g,
-)
-from weather.weather import WeatherModel
-
-
-@dataclass(frozen=True)
-class State:
-    aircraft_position: AircraftPosition
-    aircraft_state: AircraftState
-    node_id: Tuple[int, int]
-
+warnings.filterwarnings("ignore")
 
 # @dataclass(frozen=True)
 # class AircraftAction(object):
@@ -37,66 +17,10 @@ class State:
 #    aircraft_state: AircraftState
 
 
-def get_data(p0: LatLon, p1: LatLon, np: int, nc: int):
-    np2 = np // 2
-    nc2 = nc // 2
-
-    distp = 10 * p0.distanceTo(p1) / np / nc  # meters
-
-    pt = [[None for j in range(nc)] for i in range(np)]
-
-    # set boundaries
-    for j in range(nc):
-        pt[0][j] = p0
-        pt[np - 1][j] = p1
-
-    # direct path between p0 and p1
-    for i in range(1, np - 1):
-        bearing = pt[i - 1][nc2].initialBearingTo(p1)
-        total_distance = pt[i - 1][nc2].distanceTo(pt[np - 1][nc2])
-        pt[i][nc2] = pt[i - 1][nc2].destination(total_distance / (np - i), bearing)
-
-    bearing = pt[np2 - 1][nc2].initialBearingTo(pt[np2 + 1][nc2])
-    pt[np2][nc - 1] = pt[np2][nc2].destination(distp * nc2, bearing + 90)
-    pt[np2][0] = pt[np2][nc2].destination(distp * nc2, bearing - 90)
-
-    for j in range(1, nc2 + 1):
-        # +j (left)
-        bearing = pt[np2][nc2 + j - 1].initialBearingTo(pt[np2][nc - 1])
-        total_distance = pt[np2][nc2 + j - 1].distanceTo(pt[np2][nc - 1])
-        pt[np2][nc2 + j] = pt[np2][nc2 + j - 1].destination(
-            total_distance / (nc2 - j + 1), bearing
-        )
-        # -j (right)
-        bearing = pt[np2][nc2 - j + 1].initialBearingTo(pt[np2][0])
-        total_distance = pt[np2][nc2 - j + 1].distanceTo(pt[np2][0])
-        pt[np2][nc2 - j] = pt[np2][nc2 - j + 1].destination(
-            total_distance / (nc2 - j + 1), bearing
-        )
-        for i in range(1, np2):
-            # first halp (p0 to np2)
-            bearing = pt[i - 1][nc2 + j].initialBearingTo(pt[np2][nc2 + j])
-            total_distance = pt[i - 1][nc2 + j].distanceTo(pt[np2][nc2 + j])
-            pt[i][nc2 + j] = pt[i - 1][nc2 + j].destination(
-                total_distance / (np2 - i + 1), bearing
-            )
-            bearing = pt[i - 1][nc2 - j].initialBearingTo(pt[np2][nc2 - j])
-            total_distance = pt[i - 1][nc2 - j].distanceTo(pt[np2][nc2 - j])
-            pt[i][nc2 - j] = pt[i - 1][nc2 - j].destination(
-                total_distance / (np2 - i + 1), bearing
-            )
-            # second half (np2 to p1)
-            bearing = pt[np2 + i - 1][nc2 + j].initialBearingTo(pt[np - 1][nc2 + j])
-            total_distance = pt[np2 + i - 1][nc2 + j].distanceTo(pt[np - 1][nc2 + j])
-            pt[np2 + i][nc2 + j] = pt[np2 + i - 1][nc2 + j].destination(
-                total_distance / (np2 - i + 1), bearing
-            )
-            bearing = pt[np2 + i - 1][nc2 - j].initialBearingTo(pt[np - 1][nc2 - j])
-            total_distance = pt[np2 + i - 1][nc2 - j].distanceTo(pt[np - 1][nc2 - j])
-            pt[np2 + i][nc2 - j] = pt[np2 + i - 1][nc2 - j].destination(
-                total_distance / (np2 - i + 1), bearing
-            )
-    return pt
+@dataclass
+class State(object):
+    trajectory: pd.DataFrame
+    pos: Tuple[int, int]
 
 
 def get_cost(state: State, action: State):
@@ -106,263 +30,213 @@ def get_cost(state: State, action: State):
 class FlightPlanningDomain(object):
     def __init__(
         self,
-        initial_state: State,
-        final_state: State,
-        aircraft_performance_model: BADA4_jet_CR,
-        weather_model: WeatherModel = None,
-        cost_index: float = 1.0,
-        pt: List[List[LatLon]] = None,
+        origin: Union[str, tuple],
+        destination: Union[str, tuple],
+        actype: str,
+        m0: float = 0.8,
+        winfield: pd.DataFrame = None,
+        objective: Union[str, tuple] = "fuel",
     ):
         """A simple class to compute a flight plan.
 
         Parameters
         ----------
-        initiall_state : State
-            The initial state of the planning problem.
-        final_state : State
-            The goal state of the planning problem.
-        aircraft : BADA4_jet_CR
-            The BADA aircraft model.
+        origin: Union[str, tuple])
+            ICAO or IATA code of airport, or tuple (lat, lon)
+        destination: Union[str, tuple]
+            ICAO or IATA code of airport, or tuple (lat, lon)
+        aircraft : str
+            The OpenAP aircraft type.
+        m0: float
+            Takeoff mass factor. Defaults to 0.8 (of MTOW)
+        windfield: pd.DataFrame
+            Wind field data. Defaults to None.
+        objective: Union[str, tuple]
+            The objective of the flight. Defaults to "fuel". Can be a tuple if different objective
+            for climb, cruise and descent.
         """
-        self.initial_state = initial_state
-        self.final_state = final_state
-        self.apm = aircraft_performance_model
-        self.weather_model = weather_model
-        self.cost_index = cost_index
-        assert pt is not None
-        self.pt = pt
-
-    # CD: Drag coefficient
-    # CL: Lift coefficient
-
-    def get_next_state(self, current_state: State, current_action: Action) -> State:
-
-        uv_wind = self.weather_model.get_wind_speed(current_state.aircraft_position)
-
-        print(f"uv_wind: {uv_wind}")
-
-        # Moving from point A (current_state) to point B (given by action)
-
-        delta_t = 0.001
-
-        p0 = LatLon(
-            current_state.aircraft_position.lat,
-            current_state.aircraft_position.lon,
-            current_state.aircraft_position.alt,
-        )
-        p1 = LatLon(
-            current_action.aircraft_position.lat,
-            current_action.aircraft_position.lon,
-            current_action.aircraft_position.alt,
-        )
-
-        total_distance = p0.distanceTo(p1)
-        course = p0.bearingTo(p1)
-
-        environment_state = ISA().get_environment_state(current_state.aircraft_position)
-
-        if self.weather_model is not None:
-            temperature = self.weather_model.get_temperature(
-                current_state.aircraft_position
-            )
+        self.origin = origin
+        self.destination = destination
+        #
+        if isinstance(objective, str):
+            self.objective = (objective, objective, objective)
         else:
-            temperature = ISA().get_temperature(current_state.aircraft_position)
+            self.objective = objective
 
-        print(f"temperature: {temperature}")
+        print(f"origin: {origin}, destination: {destination}, actype: {actype}")
+        # Define optimizers
+        self.cruise = Cruise(actype, origin, destination, m0)
+        self.climb = Climb(actype, origin, destination, m0)
+        self.descent = Descent(actype, origin, destination, m0)
 
-        dh = current_action.aircraft_position.alt - current_state.aircraft_position.alt
-
-        print(f"dh: {dh}")
-
-        controls = None
-        dvdh = 0
-        if dh > 0:
-            # Climb
-            controls = ControlLaws(self.apm).get_climb_controls(
-                current_state.environment_state, current_state.aircraft_state, dvdh
+        if windfield is not None:
+            w = wind.PolyWind(
+                windfield,
+                self.cruise.proj,
+                self.cruise.lat1,
+                self.cruise.lon1,
+                self.cruise.lat2,
+                self.cruise.lon2,
             )
-        elif dh < 0:
-            # Descent
-            controls = ControlLaws(self.apm).get_descent_controls(
-                current_state.environment_state, current_state.aircraft_state, dvdh
-            )
-        else:
-            # Cruise
-            controls = ControlLaws(self.apm).get_cruise_controls(
-                current_state.environment_state, current_state.aircraft_state
-            )
+            self.cruise.wind = w
+            self.climb.wind = w
+            self.descent.wind = w
 
-        v_dot = self.apm.v_dot(
-            current_state.environment_state, current_state.aircraft_state, controls
+        # Find the approximate cruise altitude
+        dfcr = self.cruise.trajectory(self.objective[1])
+
+        # Find optimal climb trajectory
+        self.dfcl = self.climb.trajectory(self.objective[0], dfcr)
+
+        # Build network
+        self.np: int = 41
+        self.nc: int = 11
+        self.network = self.get_network(
+            LatLon(self.dfcl.lat.iloc[-1], self.dfcl.lon.iloc[-1]),
+            LatLon(self.cruise.lat2, self.cruise.lon2),
+            self.np,
+            self.nc,
         )
 
-        m_dot = self.apm.m_dot(
-            current_state.environment_state, current_state.aircraft_state, controls
-        )
+    def get_initial_state(self):
+        return State(self.dfcl, (0, 0))
 
-        return v_dot, m_dot
+    def get_network(self, p0: LatLon, p1: LatLon, np: int, nc: int):
+        np2 = np // 2
+        nc2 = nc // 2
+
+        distp = 10 * p0.distanceTo(p1) / np / nc  # meters
+
+        pt = [[None for j in range(nc)] for i in range(np)]
+
+        # set boundaries
+        for j in range(nc):
+            pt[0][j] = p0
+            pt[np - 1][j] = p1
+
+        # direct path between p0 and p1
+        for i in range(1, np - 1):
+            bearing = pt[i - 1][nc2].initialBearingTo(p1)
+            total_distance = pt[i - 1][nc2].distanceTo(pt[np - 1][nc2])
+            pt[i][nc2] = pt[i - 1][nc2].destination(total_distance / (np - i), bearing)
+
+        bearing = pt[np2 - 1][nc2].initialBearingTo(pt[np2 + 1][nc2])
+        pt[np2][nc - 1] = pt[np2][nc2].destination(distp * nc2, bearing + 90)
+        pt[np2][0] = pt[np2][nc2].destination(distp * nc2, bearing - 90)
+
+        for j in range(1, nc2 + 1):
+            # +j (left)
+            bearing = pt[np2][nc2 + j - 1].initialBearingTo(pt[np2][nc - 1])
+            total_distance = pt[np2][nc2 + j - 1].distanceTo(pt[np2][nc - 1])
+            pt[np2][nc2 + j] = pt[np2][nc2 + j - 1].destination(
+                total_distance / (nc2 - j + 1), bearing
+            )
+            # -j (right)
+            bearing = pt[np2][nc2 - j + 1].initialBearingTo(pt[np2][0])
+            total_distance = pt[np2][nc2 - j + 1].distanceTo(pt[np2][0])
+            pt[np2][nc2 - j] = pt[np2][nc2 - j + 1].destination(
+                total_distance / (nc2 - j + 1), bearing
+            )
+            for i in range(1, np2):
+                # first halp (p0 to np2)
+                bearing = pt[i - 1][nc2 + j].initialBearingTo(pt[np2][nc2 + j])
+                total_distance = pt[i - 1][nc2 + j].distanceTo(pt[np2][nc2 + j])
+                pt[i][nc2 + j] = pt[i - 1][nc2 + j].destination(
+                    total_distance / (np2 - i + 1), bearing
+                )
+                bearing = pt[i - 1][nc2 - j].initialBearingTo(pt[np2][nc2 - j])
+                total_distance = pt[i - 1][nc2 - j].distanceTo(pt[np2][nc2 - j])
+                pt[i][nc2 - j] = pt[i - 1][nc2 - j].destination(
+                    total_distance / (np2 - i + 1), bearing
+                )
+                # second half (np2 to p1)
+                bearing = pt[np2 + i - 1][nc2 + j].initialBearingTo(pt[np - 1][nc2 + j])
+                total_distance = pt[np2 + i - 1][nc2 + j].distanceTo(
+                    pt[np - 1][nc2 + j]
+                )
+                pt[np2 + i][nc2 + j] = pt[np2 + i - 1][nc2 + j].destination(
+                    total_distance / (np2 - i + 1), bearing
+                )
+                bearing = pt[np2 + i - 1][nc2 - j].initialBearingTo(pt[np - 1][nc2 - j])
+                total_distance = pt[np2 + i - 1][nc2 - j].distanceTo(
+                    pt[np - 1][nc2 - j]
+                )
+                pt[np2 + i][nc2 - j] = pt[np2 + i - 1][nc2 - j].destination(
+                    total_distance / (np2 - i + 1), bearing
+                )
+        return pt
 
     def is_terminal_state(self, state: State) -> bool:
         # Did we reach the end of the graph?
-        print(f"State: {state.node_id}")
-        # print(f"{type(state.node_id)}")
-        return state.node_id[0] == self.final_state.node_id[0] - 1
+        return state.pos[0] == self.np - 1
 
     def get_next_available_actions(self, current_state: State) -> List[State]:
+        # x0, y0 = self.initial_state.node_id
+        # x1, y1 = self.final_state.node_id
 
-        print(f"State: {current_state}")
-
-        x0, y0 = self.initial_state.node_id
-        x1, y1 = self.final_state.node_id
-
-        x, y = current_state.node_id
+        x, y = current_state.pos
 
         if self.is_terminal_state(current_state):
             print("We are done !!!")
             return []
 
-        # find best local mach & altitude
-
-        # get environment state from ISA model [TODO: Could also be done with a weather simulation]
-        environment_state = ISA().get_environment_state(current_state.aircraft_position)
-        # TODO: Could also be doe with a weather model
-        # pressure = ISA().get_pressure(current_state.aircraft_position)
-
-        # inject wind speed from weather model if any
-        environment_state.wind = self.weather_model.get_wind_speed(
-            current_state.aircraft_position
-        )
-
-        a = environment_state.get_sound_speed()
-        print(f"speed of sound: {a}")
-        print(f"LHV: {self.apm.LHV}")
-        print(f"delta: {environment_state.delta()}")
-        print(f"MTOW: {self.apm.MTOW}")
-
-        CCI = (
-            self.cost_index
-            * self.apm.LHV
-            / environment_state.delta()
-            / (self.apm.MTOW * g)
-            / a
-        )
-        # check coeff from bada tables
-        CW = current_state.aircraft_state.m / (
-            self.apm.MTOW * environment_state.delta()
-        )
-
-        print(f"CCI: {CCI} CW: {CW}")
-        # CCI in [-0.000503, 2.161215]
-        # CW  in [ 1.097560, 5.351188]
-        try:
-            best_mach = self.apm.best_mach(CCI, CW)
-        except ValueError:
-            # no mach available outside range
-            raise ValueError("No mach available outside range")
-
-        print(f"best mach: {best_mach}")
-
-        mach = current_state.aircraft_state.M(environment_state)
-        try:
-            best_altitude = self.apm.best_alt(current_state.aircraft_state.m, mach)
-        except ValueError:
-            raise ValueError("No altitude available outside range")
-
-        print(f"best alt: {best_altitude}")
-
-        best_altitude_m = best_altitude * ft2m
-
         next_nodes = []
-        if y + 1 < y1:
-            next_nodes.append((x + 1, y + 1))
-        next_nodes.append((x + 1, y))
-        if y > y0:
-            next_nodes.append((x + 1, y - 1))
+        if x == 0:
+            for j in range(self.nc):
+                next_nodes.append((x + 1, j))
+        else:
+            if y + 1 < self.nc:
+                next_nodes.append((x + 1, y + 1))
+            next_nodes.append((x + 1, y))
+            if y > 0:
+                next_nodes.append((x + 1, y - 1))
 
-        deltat_mach = 0.1
-        machs = [best_mach - deltat_mach, best_mach, best_mach + deltat_mach]
-        delta_altitude = 100
-        altitudes = [
-            best_altitude_m - delta_altitude,
-            best_altitude_m,
-            best_altitude_m + delta_altitude,
-        ]
-
-        initial_position = LatLon(self.pt[x][y].lat, self.pt[x][y].lon, self.pt[x][y].alt)
-
+        next_actions = []
         for node in next_nodes:
-            for mach in machs:
-                for altitude in altitudes:
-                    # Let's compute the cost of this action
-                    print(
-                        f"tas: {true_air_speed}, heading: {heading}, flight_path_angle: {flight_path_angle}, mass: {mass}"
-                    )
-                    candidate_position = LatLon(self.pt[node[0]][node[1]].lat, self.pt[node[0]][node[1]].lon, altitude)
-
-                    current_position = candidate_position
-
-                    while current_position.distanceTo(candidate_position)> 1:
-                        print(f"not at destination")
-                        #
-                        heading = current_position.bearingTo(candidate_position)
-                        #
-
-
-
-                    # Integration et calcul de la vitesse
-                    while
-
-
-                    #
-
-
-                    #v_dot, m_dot = self.get_next_state(current_state, candidate_state)
-                    self.apm.get_fuel_burn_at_cruise_conditions(environment_state, aircraft_state)
-                    print(f"v_dot: {v_dot}, m_dot: {m_dot}")
-
-        # create new states
-        next_actions = [
-            State(
-                AircraftPosition(
-                    self.pt[node[0]][node[1]].lat, self.pt[node[0]][node[1]].lon, alt, 0
-                ),
-                AircraftState(true_air_speed, heading, flight_path_angle, mass),
-                (node[0], node[1]),
-            )
-            for node in next_nodes
-            for alt in altitudes
-            for mach in machs
-        ]
-
-        print(f"There is {len(next_actions)} actions to choose from")
+            self.cruise.initial_mass = current_state.trajectory.mass.iloc[-1]
+            self.cruise.lat1 = current_state.trajectory.lat.iloc[-1]
+            self.cruise.lon1 = current_state.trajectory.lon.iloc[-1]
+            ts = current_state.trajectory.ts.iloc[-1]
+            # Update wind information
+            # self.cruise.wind =
+            self.cruise.lat2 = self.network[node[0]][node[1]].lat
+            self.cruise.lon2 = self.network[node[0]][node[1]].lon
+            dfcr = self.cruise.trajectory(self.objective[1])
+            next_actions.append(State(dfcr, node))
 
         return next_actions
+
+    def get_next_state(self, current_state: State, current_action: Action) -> State:
+        current_action.trajectory.ts = (
+            current_state.trajectory.ts.iloc[-1] + current_action.trajectory.ts
+        )
+        state = State(
+            pd.concat(
+                [current_state.trajectory, current_action.trajectory], ignore_index=True
+            ),
+            current_action.pos,
+        )
+        return state
+
+    def get_best_action(self, actions: List[Action]) -> Action:
+        best_action = actions[0]
+        best_objective = sys.float_info.max
+        for action in actions:
+            if action.trajectory[self.objective[1]].iloc[-1] <= best_objective:
+                best_objective = action.trajectory[self.objective[1]].iloc[-1]
+                best_action = action
+
+        return best_action
 
 
 if __name__ == "__main__":
     # Initialize the environment
 
-    LFBO = (43.6294375, 1.3654988)
-    LFPO = (48.7262321, 2.3630535)
-
-    np: int = 11  # number of points along a trajectory
-    nc: int = 11  # number of trajectories
-
-    altitude = 10000  # m
-
-    p0: LatLon = LatLon(*LFBO, altitude)
-    p1: LatLon = LatLon(*LFPO, altitude)
-
-    # Using OpenAP-TOP
-
-    optimizer = otop.CompleteFlight("A320", "LFBO", "LFPO", m0=0.85)
-
-    fgrib = "path_to_the_wind_data.grib"
-    windfield = otop.wind.read_grib(fgrib)
-    otop.enable_wind(windfield)
-
-    flight = optimizer.trajectory(objective="fuel")
-
+    origin = "LFPG"
+    destination = "WSSS"
+    # 1st May 2021 8am
+    fgrib = "data/adaptor.mars.internal-1659588957.360821-19344-9-b2135488-9725-486e-b3d2-adf40cb68242.grib"
+    windfield = wind.read_grib(fgrib)
 
     # Flying from LFBO to LFPO (see http://rfinder.asalink.net/free/)
     # ID      FREQ   TRK   DIST   Coords                       Name/Remarks
@@ -374,34 +248,6 @@ if __name__ == "__main__":
     # LFPO            33     94   N48°43'23.81" E002°22'46.48" PARIS ORLY
 
     # Initialize the planning domain
-
-    aircraft = BADA4_jet_CR("A320-231")
-
-    now = datetime.now() - timedelta(days=1)
-    print(f"Simulated date and time {now}")
-
-    # Initial conditions
-    # K[T|I|C]AS = Knots [True | Indicated | Calibrated] Air Speed
-    true_air_speed = 225  # ms^-1
-    heading = 0
-    flight_path_angle = 0
-    mass = aircraft.MTOW * 0.8  # 80% of MTOW
-
-    print(
-        f"Initial conditions: {p0.lat} {p0.lon} {p0.height} {true_air_speed} {heading} {flight_path_angle} {mass}"
-    )
-
-    initial_state = State(
-        AircraftPosition(p0.lat, p0.lon, p0.height, 0),
-        AircraftState(true_air_speed, heading, flight_path_angle, mass),
-        (0, 0),
-    )
-
-    final_state = State(
-        AircraftPosition(p1.lat, p1.lon, p1.height, None),
-        AircraftState(0, 0, 0, 0),
-        (np, nc),
-    )
 
     # A380-841
     # Departure: LFPG (N49° 00' 36", E2° 32' 55")
@@ -420,25 +266,16 @@ if __name__ == "__main__":
 
     # Heuristiques ? fuel = distance_restante_grand_cercle * mean_consumption_fuel
 
-    weather_model = WeatherModel(now)
+    domain = FlightPlanningDomain("LFPG", "WSSS", "A388", winfield=windfield)
 
-    domain = FlightPlanningDomain(
-        initial_state, final_state, aircraft, weather_model, pt=get_data(p0, p1, np, nc)
-    )
-
-    current_state = initial_state
+    current_state = domain.get_initial_state()
     while not domain.is_terminal_state(current_state):
-        print(
-            f"At time: {weather_model.dof + timedelta(seconds=current_state.aircraft_position.t)}"
-        )
-        print(
-            f"Aircraft position: {current_state.aircraft_position.lat:2.2f} {current_state.aircraft_position.lon:2.2f} {current_state.aircraft_position.alt}"
-        )
-
         actions = domain.get_next_available_actions(current_state)
 
-        action = rnd.choices(actions)
+        action = domain.get_best_action(actions)
 
-        print(f"Choice is: {action}")
+        current_state = domain.get_next_state(current_state, action)
 
-        current_state = action[0]
+        print(f"Current state: {current_state}\n---------")
+
+    current_state.trajectory.to_csv(f"data/trajectory_{origin}_{destination}.csv")
