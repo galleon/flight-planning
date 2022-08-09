@@ -1,30 +1,29 @@
+import logging
+from logging.handlers import TimedRotatingFileHandler
 import sys
 import warnings
 
 from argparse import Action
-from dataclasses import dataclass
-from typing import List, Tuple, Union
+from typing import List, NamedTuple, Tuple, Union
+from time import time
 
 import pandas as pd
 from openap.top import Climb, Cruise, Descent, wind
+from openap.top.full import MultiPhase
 from pygeodesy.ellipsoidalVincenty import LatLon
 
 warnings.filterwarnings("ignore")
 
-# @dataclass(frozen=True)
-# class AircraftAction(object):
-#    aircraft_position: AircraftPosition
-#    aircraft_state: AircraftState
 
-
-@dataclass
-class State(object):
+class State(NamedTuple):
     trajectory: pd.DataFrame
     pos: Tuple[int, int]
 
 
-def get_cost(state: State, action: State):
-    return state.aircraft_position.distanceTo(action.aircraft_position)
+# logger = logging.getLogger(__name__)
+# logger.setLevel(logging.DEBUG)
+# logger.addHandler(TimedRotatingFileHandler(f"{__name__}.log", when='midnight'))
+# logger.addHandler(logging.StreamHandler(sys.stdout)
 
 
 class FlightPlanningDomain(object):
@@ -34,7 +33,7 @@ class FlightPlanningDomain(object):
         destination: Union[str, tuple],
         actype: str,
         m0: float = 0.8,
-        winfield: pd.DataFrame = None,
+        windfield: pd.DataFrame = None,
         objective: Union[str, tuple] = "fuel",
     ):
         """A simple class to compute a flight plan.
@@ -69,6 +68,8 @@ class FlightPlanningDomain(object):
         self.climb = Climb(actype, origin, destination, m0)
         self.descent = Descent(actype, origin, destination, m0)
 
+        self.multiphase = MultiPhase(actype, origin, destination, m0)
+
         if windfield is not None:
             w = wind.PolyWind(
                 windfield,
@@ -81,9 +82,17 @@ class FlightPlanningDomain(object):
             self.cruise.wind = w
             self.climb.wind = w
             self.descent.wind = w
+            self.multiphase.wind = w
 
         # Find the approximate cruise altitude
         dfcr = self.cruise.trajectory(self.objective[1])
+
+        # Run multiphase flight
+        tick = time()
+        dfmp = self.multiphase.trajectory(self.objective)
+        print(f"Time to compute multiphase: {time() - tick}")
+        dfmp.to_csv(f"multiphase_{origin}_{destination}.csv")
+        print(dfmp.columns)
 
         # Find optimal climb trajectory
         self.dfcl = self.climb.trajectory(self.objective[0], dfcr)
@@ -192,17 +201,26 @@ class FlightPlanningDomain(object):
                 next_nodes.append((x + 1, y - 1))
 
         next_actions = []
+        tick = time()
         for node in next_nodes:
+            # Set the initial conditions of the new cruise leg
             self.cruise.initial_mass = current_state.trajectory.mass.iloc[-1]
             self.cruise.lat1 = current_state.trajectory.lat.iloc[-1]
             self.cruise.lon1 = current_state.trajectory.lon.iloc[-1]
+            # Extract current time to set wind conditions
             ts = current_state.trajectory.ts.iloc[-1]
             # Update wind information
             # self.cruise.wind =
+            # Set destination point
             self.cruise.lat2 = self.network[node[0]][node[1]].lat
             self.cruise.lon2 = self.network[node[0]][node[1]].lon
+            # Set number of points
+            self.cruise.setup_dc(nodes=20)
+            # Compute the optimal trajectory
             dfcr = self.cruise.trajectory(self.objective[1])
             next_actions.append(State(dfcr, node))
+
+        print(f"Time to compute next actions: {time() - tick}")
 
         return next_actions
 
@@ -234,9 +252,12 @@ if __name__ == "__main__":
 
     origin = "LFPG"
     destination = "WSSS"
-    # 1st May 2021 8am
-    fgrib = "data/adaptor.mars.internal-1659588957.360821-19344-9-b2135488-9725-486e-b3d2-adf40cb68242.grib"
+    #
+    fgrib = "data/adaptor.mars.internal-1660049600.592577-31348-4-6fc2ef7e-de0a-4dcb-9a4e-6d61345f126f.grib"
     windfield = wind.read_grib(fgrib)
+
+    print(windfield.iloc(0))
+    print(windfield.iloc(1_000_000))
 
     # Flying from LFBO to LFPO (see http://rfinder.asalink.net/free/)
     # ID      FREQ   TRK   DIST   Coords                       Name/Remarks
@@ -266,7 +287,7 @@ if __name__ == "__main__":
 
     # Heuristiques ? fuel = distance_restante_grand_cercle * mean_consumption_fuel
 
-    domain = FlightPlanningDomain("LFPG", "WSSS", "A388", winfield=windfield)
+    domain = FlightPlanningDomain("LFPG", "WSSS", "A388", windfield=windfield)
 
     current_state = domain.get_initial_state()
     while not domain.is_terminal_state(current_state):
