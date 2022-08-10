@@ -1,16 +1,24 @@
 import logging
-from logging.handlers import TimedRotatingFileHandler
 import sys
 import warnings
-
 from argparse import Action
-from typing import List, NamedTuple, Tuple, Union
+from enum import Enum
+from logging.handlers import TimedRotatingFileHandler
 from time import time
+from typing import Any, List, NamedTuple, Optional, Tuple, Union
 
+import matplotlib.pyplot as plt
 import pandas as pd
 from openap.top import Climb, Cruise, Descent, wind
 from openap.top.full import MultiPhase
+from openap.top.vis import trajectory_on_map
 from pygeodesy.ellipsoidalVincenty import LatLon
+from skdecide import DeterministicPlanningDomain, Solver, Space, Value
+from skdecide.builders.domain import Renderable, UnrestrictedActions
+from skdecide.hub.solver.astar import Astar
+from skdecide.hub.solver.stable_baselines import StableBaseline
+from skdecide.hub.space.gym import EnumSpace, ListSpace, MultiDiscreteSpace
+from skdecide.utils import match_solvers
 
 warnings.filterwarnings("ignore")
 
@@ -20,13 +28,27 @@ class State(NamedTuple):
     pos: Tuple[int, int]
 
 
+class Action(NamedTuple):
+    pos: Tuple[int, int]
+
+
 # logger = logging.getLogger(__name__)
 # logger.setLevel(logging.DEBUG)
 # logger.addHandler(TimedRotatingFileHandler(f"{__name__}.log", when='midnight'))
 # logger.addHandler(logging.StreamHandler(sys.stdout)
 
 
-class FlightPlanningDomain(object):
+class D(DeterministicPlanningDomain, UnrestrictedActions, Renderable):
+    T_state = State  # Type of states
+    T_observation = State  # Type of observations
+    T_event = Action  # Type of events
+    T_value = float  # Type of transition values (rewards or costs)
+    T_predicate = bool  # Type of transition predicates (terminal states)
+    T_info = None  # Type of additional information in environment outcome
+    T_agent = Union  # Type of agent
+
+
+class FlightPlanningDomain(D):
     def __init__(
         self,
         origin: Union[str, tuple],
@@ -85,17 +107,22 @@ class FlightPlanningDomain(object):
             self.multiphase.wind = w
 
         # Find the approximate cruise altitude
+        tick = time()
         dfcr = self.cruise.trajectory(self.objective[1])
+        print(f"Cruise trajectory computed in {time() - tick:.2f} seconds")
 
         # Run multiphase flight
-        tick = time()
-        dfmp = self.multiphase.trajectory(self.objective)
+        # tick = time()
+        # dfmp = self.multiphase.trajectory(self.objective)
         print(f"Time to compute multiphase: {time() - tick}")
-        dfmp.to_csv(f"multiphase_{origin}_{destination}.csv")
-        print(dfmp.columns)
+        # dfmp.to_csv(f"multiphase_{origin}_{destination}.csv")
 
         # Find optimal climb trajectory
+        tick = time()
         self.dfcl = self.climb.trajectory(self.objective[0], dfcr)
+        print(f"Climb trajectory computed in {time() - tick:.2f} seconds")
+
+        self.start = State(self.dfcl, (0, 0))
 
         # Build network
         self.np: int = 41
@@ -107,8 +134,235 @@ class FlightPlanningDomain(object):
             self.nc,
         )
 
-    def get_initial_state(self):
-        return State(self.dfcl, (0, 0))
+    def _get_next_state(self, memory: D.T_state, action: D.T_event) -> D.T_state:
+        """
+        Compute the next state from:
+          - memory: the current state
+          - action: the action to take
+        """
+        trajectory = memory.trajectory.copy()
+
+        self.cruise.initial_mass = memory.trajectory.mass.iloc[-1]
+        self.cruise.lat1 = memory.trajectory.lat.iloc[-1]
+        self.cruise.lon1 = memory.trajectory.lon.iloc[-1]
+        # Extract current time to set wind conditions
+        ts = trajectory.ts.iloc[-1]
+        # Update wind information
+        # self.cruise.wind =
+
+        # Set intermediate destination point
+        node = action.pos
+        self.cruise.lat2 = self.network[node[0]][node[1]].lat
+        self.cruise.lon2 = self.network[node[0]][node[1]].lon
+        # Set number of colocation points
+        self.cruise.setup_dc(nodes=5)
+        # Compute the optimal trajectory
+        dfcr = self.cruise.trajectory(self.objective[1])
+        # Concatenate the two trajectories
+
+        dfcr.ts = memory.trajectory.ts.iloc[-1] + dfcr.ts
+
+        state = State(
+            pd.concat([memory.trajectory, dfcr], ignore_index=True),
+            action.pos,
+        )
+        return state
+
+    def _get_transition_value(
+        self,
+        memory: D.T_state,
+        action: D.T_event,
+        next_state: Optional[D.T_state] = None,
+    ) -> Value[D.T_value]:
+        """
+        Get the value (reward or cost) of a transition.
+
+        Set cost to 1 when moving (energy cost)
+        and to 2 when bumping into a wall (damage cost).
+        """
+        self.cruise.initial_mass = memory.trajectory.mass.iloc[-1]
+        self.cruise.lat1 = memory.trajectory.lat.iloc[-1]
+        self.cruise.lon1 = memory.trajectory.lon.iloc[-1]
+        # Extract current time to set wind conditions
+        ts = memory.trajectory.ts.iloc[-1]
+        # Update wind information
+        # self.cruise.wind = None
+        node = action.pos
+        self.cruise.lat2 = self.network[node[0]][node[1]].lat
+        self.cruise.lon2 = self.network[node[0]][node[1]].lon
+        # Set number of colocation points
+        self.cruise.setup_dc(nodes=5)
+        # Compute the optimal trajectory
+        dfcr = self.cruise.trajectory(self.objective[1])
+        # Extract last row as a dataframe
+        print(dfcr.iloc[-1:])
+
+        return Value(cost=1)
+
+    def _get_initial_state_(self) -> D.T_state:
+        """
+        Get the initial state.
+
+        Set the start position as initial state.
+        """
+        return self.start
+
+    def _get_goals_(self) -> Space[D.T_observation]:
+        """
+        Get the domain goals space (finite or infinite set).
+
+        Set the end position as goal.
+        """
+        return ListSpace([(self.np - 1, j) for j in range(self.nc)])
+
+    def _is_terminal(self, state: State) -> D.T_predicate:
+        """
+        Indicate whether a state is terminal.
+
+        Stop an episode only when goal reached.
+        """
+        return state.pos[0] == self.np - 1
+
+    def _get_applicable_actions_from(self, memory: D.T_state) -> Space[D.T_event]:
+        """
+        Get the applicable actions from a state.
+        """
+        x, y = memory.pos
+
+        next_nodes = []
+        if x == 0:
+            for j in range(self.nc):
+                next_nodes.append((x + 1, j))
+        elif x < self.np - 1:
+            if y + 1 < self.nc:
+                next_nodes.append((x + 1, y + 1))
+            next_nodes.append((x + 1, y))
+            if y > 0:
+                next_nodes.append((x + 1, y - 1))
+
+        return ListSpace([next_nodes])
+
+    def _get_action_space_(self) -> Space[D.T_event]:
+        """
+        Define action space.
+        """
+        return EnumSpace(Action)
+
+    def _get_observation_space_(self) -> Space[D.T_observation]:
+        """
+        Define observation space.
+        """
+        return MultiDiscreteSpace([self.np, self.nc])
+
+    def _render_from(self, memory: State, **kwargs: Any) -> Any:
+        """
+        Render visually the map.
+
+        Returns:
+            matplotlib figure
+        """
+        # store used matplotlib subplot and image to only update them afterwards
+        plt.ioff()
+        fig, ax = plt.subplots(1)
+        ax.set_aspect("equal")  # set the x and y axes to the same scale
+        plt.xticks([])  # remove the tick marks by setting to an empty list
+        plt.yticks([])  # remove the tick marks by setting to an empty list
+        ax.invert_yaxis()  # invert the y-axis so the first row of data is at the top
+        plt.ion()
+        fig.canvas.header_visible = False
+        fig.canvas.footer_visible = False
+        fig.canvas.resizable = False
+        fig.set_dpi(1)
+        fig.set_figwidth(600)
+        fig.set_figheight(600)
+        if image is None:
+            image = ax.imshow(image_data)
+        else:
+            image.set_data(image_data)
+            image.figure.canvas.draw()
+        return ax, image
+
+    def heuristic(self, s: D.T_state) -> Value[D.T_value]:
+        """Heuristic to be used by search algorithms.
+
+        Here Euclidean distance to goal.
+
+        """
+        return Value(cost=0)
+
+    # def get_initial_state(self):
+    #     return State(self.dfcl, (0, 0))
+
+    # def is_terminal_state(self, state: State) -> bool:
+    #     # Did we reach the end of the graph?
+    #     return state.pos[0] == self.np - 1
+
+    # def get_next_available_actions(self, current_state: State) -> List[State]:
+    #     # x0, y0 = self.initial_state.node_id
+    #     # x1, y1 = self.final_state.node_id
+
+    #     x, y = current_state.pos
+
+    #     if self.is_terminal_state(current_state):
+    #         print("We are done !!!")
+    #         return []
+
+    #     next_nodes = []
+    #     if x == 0:
+    #         for j in range(self.nc):
+    #             next_nodes.append((x + 1, j))
+    #     else:
+    #         if y + 1 < self.nc:
+    #             next_nodes.append((x + 1, y + 1))
+    #         next_nodes.append((x + 1, y))
+    #         if y > 0:
+    #             next_nodes.append((x + 1, y - 1))
+
+    #     next_actions = []
+    #     tick = time()
+    #     for node in next_nodes:
+    #         # Set the initial conditions of the new cruise leg
+    #         self.cruise.initial_mass = current_state.trajectory.mass.iloc[-1]
+    #         self.cruise.lat1 = current_state.trajectory.lat.iloc[-1]
+    #         self.cruise.lon1 = current_state.trajectory.lon.iloc[-1]
+    #         # Extract current time to set wind conditions
+    #         ts = current_state.trajectory.ts.iloc[-1]
+    #         # Update wind information
+    #         # self.cruise.wind =
+    #         # Set destination point
+    #         self.cruise.lat2 = self.network[node[0]][node[1]].lat
+    #         self.cruise.lon2 = self.network[node[0]][node[1]].lon
+    #         # Set number of points
+    #         self.cruise.setup_dc(nodes=20)
+    #         # Compute the optimal trajectory
+    #         dfcr = self.cruise.trajectory(self.objective[1])
+    #         next_actions.append(State(dfcr, node))
+
+    #     print(f"Time to compute next actions: {time() - tick}")
+
+    #     return next_actions
+
+    # def get_next_state(self, current_state: State, current_action: Action) -> State:
+    #     current_action.trajectory.ts = (
+    #         current_state.trajectory.ts.iloc[-1] + current_action.trajectory.ts
+    #     )
+    #     state = State(
+    #         pd.concat(
+    #             [current_state.trajectory, current_action.trajectory], ignore_index=True
+    #         ),
+    #         current_action.pos,
+    #     )
+    #     return state
+
+    # def get_best_action(self, actions: List[Action]) -> Action:
+    #     best_action = actions[0]
+    #     best_objective = sys.float_info.max
+    #     for action in actions:
+    #         if action.trajectory[self.objective[1]].iloc[-1] <= best_objective:
+    #             best_objective = action.trajectory[self.objective[1]].iloc[-1]
+    #             best_action = action
+
+    #     return best_action
 
     def get_network(self, p0: LatLon, p1: LatLon, np: int, nc: int):
         np2 = np // 2
@@ -175,77 +429,6 @@ class FlightPlanningDomain(object):
                 )
         return pt
 
-    def is_terminal_state(self, state: State) -> bool:
-        # Did we reach the end of the graph?
-        return state.pos[0] == self.np - 1
-
-    def get_next_available_actions(self, current_state: State) -> List[State]:
-        # x0, y0 = self.initial_state.node_id
-        # x1, y1 = self.final_state.node_id
-
-        x, y = current_state.pos
-
-        if self.is_terminal_state(current_state):
-            print("We are done !!!")
-            return []
-
-        next_nodes = []
-        if x == 0:
-            for j in range(self.nc):
-                next_nodes.append((x + 1, j))
-        else:
-            if y + 1 < self.nc:
-                next_nodes.append((x + 1, y + 1))
-            next_nodes.append((x + 1, y))
-            if y > 0:
-                next_nodes.append((x + 1, y - 1))
-
-        next_actions = []
-        tick = time()
-        for node in next_nodes:
-            # Set the initial conditions of the new cruise leg
-            self.cruise.initial_mass = current_state.trajectory.mass.iloc[-1]
-            self.cruise.lat1 = current_state.trajectory.lat.iloc[-1]
-            self.cruise.lon1 = current_state.trajectory.lon.iloc[-1]
-            # Extract current time to set wind conditions
-            ts = current_state.trajectory.ts.iloc[-1]
-            # Update wind information
-            # self.cruise.wind =
-            # Set destination point
-            self.cruise.lat2 = self.network[node[0]][node[1]].lat
-            self.cruise.lon2 = self.network[node[0]][node[1]].lon
-            # Set number of points
-            self.cruise.setup_dc(nodes=20)
-            # Compute the optimal trajectory
-            dfcr = self.cruise.trajectory(self.objective[1])
-            next_actions.append(State(dfcr, node))
-
-        print(f"Time to compute next actions: {time() - tick}")
-
-        return next_actions
-
-    def get_next_state(self, current_state: State, current_action: Action) -> State:
-        current_action.trajectory.ts = (
-            current_state.trajectory.ts.iloc[-1] + current_action.trajectory.ts
-        )
-        state = State(
-            pd.concat(
-                [current_state.trajectory, current_action.trajectory], ignore_index=True
-            ),
-            current_action.pos,
-        )
-        return state
-
-    def get_best_action(self, actions: List[Action]) -> Action:
-        best_action = actions[0]
-        best_objective = sys.float_info.max
-        for action in actions:
-            if action.trajectory[self.objective[1]].iloc[-1] <= best_objective:
-                best_objective = action.trajectory[self.objective[1]].iloc[-1]
-                best_action = action
-
-        return best_action
-
 
 if __name__ == "__main__":
     # Initialize the environment
@@ -255,9 +438,6 @@ if __name__ == "__main__":
     #
     fgrib = "data/adaptor.mars.internal-1660049600.592577-31348-4-6fc2ef7e-de0a-4dcb-9a4e-6d61345f126f.grib"
     windfield = wind.read_grib(fgrib)
-
-    print(windfield.iloc(0))
-    print(windfield.iloc(1_000_000))
 
     # Flying from LFBO to LFPO (see http://rfinder.asalink.net/free/)
     # ID      FREQ   TRK   DIST   Coords                       Name/Remarks
@@ -287,14 +467,14 @@ if __name__ == "__main__":
 
     # Heuristiques ? fuel = distance_restante_grand_cercle * mean_consumption_fuel
 
-    domain = FlightPlanningDomain("LFPG", "WSSS", "A388", windfield=windfield)
+    domain_factory = lambda: FlightPlanningDomain(
+        "LFPG", "WSSS", "A388", windfield=windfield
+    )
 
-    current_state = domain.get_initial_state()
-    while not domain.is_terminal_state(current_state):
-        actions = domain.get_next_available_actions(current_state)
+    domain = domain_factory()
 
-        action = domain.get_best_action(actions)
+    match_solvers(domain=domain)
 
-        current_state = domain.get_next_state(current_state, action)
+    solver = Astar(heuristic=lambda d, s: d.heuristic(s))
 
-    current_state.trajectory.to_csv(f"data/trajectory_{origin}_{destination}.csv")
+    FlightPlanningDomain.solve_with(solver, domain_factory)
