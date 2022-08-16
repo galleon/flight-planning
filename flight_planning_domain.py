@@ -1,4 +1,5 @@
 import logging
+import os
 import sys
 import warnings
 from argparse import Action
@@ -13,8 +14,8 @@ from openap.top import Climb, Cruise, Descent, wind
 from openap.top.full import MultiPhase
 from openap.top.vis import trajectory_on_map
 from pygeodesy.ellipsoidalVincenty import LatLon
-from skdecide import DeterministicPlanningDomain, Solver, Space, Value
-from skdecide.builders.domain import Renderable, UnrestrictedActions
+from skdecide import DeterministicPlanningDomain, ImplicitSpace, Solver, Space, Value
+from skdecide.builders.domain import Actions, Renderable
 from skdecide.hub.solver.astar import Astar
 from skdecide.hub.solver.stable_baselines import StableBaseline
 from skdecide.hub.space.gym import EnumSpace, ListSpace, MultiDiscreteSpace
@@ -27,18 +28,18 @@ class State(NamedTuple):
     trajectory: pd.DataFrame
     pos: Tuple[int, int]
 
+    def __hash__(self):
+        return hash(self.pos)
+
+    def __eq__(self, other):
+        return self.pos == other.pos
+
 
 class Action(NamedTuple):
     pos: Tuple[int, int]
 
 
-# logger = logging.getLogger(__name__)
-# logger.setLevel(logging.DEBUG)
-# logger.addHandler(TimedRotatingFileHandler(f"{__name__}.log", when='midnight'))
-# logger.addHandler(logging.StreamHandler(sys.stdout)
-
-
-class D(DeterministicPlanningDomain, UnrestrictedActions, Renderable):
+class D(DeterministicPlanningDomain, Actions, Renderable):
     T_state = State  # Type of states
     T_observation = State  # Type of observations
     T_event = Action  # Type of events
@@ -84,7 +85,7 @@ class FlightPlanningDomain(D):
         else:
             self.objective = objective
 
-        print(f"origin: {origin}, destination: {destination}, actype: {actype}")
+        logging.info(f"origin: {origin}, destination: {destination}, actype: {actype}")
         # Define optimizers
         self.cruise = Cruise(actype, origin, destination, m0)
         self.climb = Climb(actype, origin, destination, m0)
@@ -109,18 +110,18 @@ class FlightPlanningDomain(D):
         # Find the approximate cruise altitude
         tick = time()
         dfcr = self.cruise.trajectory(self.objective[1])
-        print(f"Cruise trajectory computed in {time() - tick:.2f} seconds")
+        logging.info(f"Cruise trajectory computed in {time() - tick:.2f} seconds")
 
         # Run multiphase flight
         # tick = time()
         # dfmp = self.multiphase.trajectory(self.objective)
-        print(f"Time to compute multiphase: {time() - tick}")
+        # logging.info(f"Multiphase trajectory computed in {time() - tick:.2f} seconds")
         # dfmp.to_csv(f"multiphase_{origin}_{destination}.csv")
 
         # Find optimal climb trajectory
-        tick = time()
+        # tick = time()
         self.dfcl = self.climb.trajectory(self.objective[0], dfcr)
-        print(f"Climb trajectory computed in {time() - tick:.2f} seconds")
+        logging.info(f"Climb trajectory computed in {time() - tick:.2f} seconds")
 
         self.start = State(self.dfcl, (0, 0))
 
@@ -133,6 +134,7 @@ class FlightPlanningDomain(D):
             self.np,
             self.nc,
         )
+        logger.info(f"Constructor initialized in {time() - tick:.2f} seconds")
 
     def _get_next_state(self, memory: D.T_state, action: D.T_event) -> D.T_state:
         """
@@ -166,6 +168,7 @@ class FlightPlanningDomain(D):
             pd.concat([memory.trajectory, dfcr], ignore_index=True),
             action.pos,
         )
+        logging.info(f"Next state: {state}")
         return state
 
     def _get_transition_value(
@@ -195,7 +198,7 @@ class FlightPlanningDomain(D):
         # Compute the optimal trajectory
         dfcr = self.cruise.trajectory(self.objective[1])
         # Extract last row as a dataframe
-        print(dfcr.iloc[-1:])
+        logging.info(dfcr.iloc[-1:])
 
         return Value(cost=1)
 
@@ -232,21 +235,21 @@ class FlightPlanningDomain(D):
         next_nodes = []
         if x == 0:
             for j in range(self.nc):
-                next_nodes.append((x + 1, j))
+                next_nodes.append(Action((x + 1, j)))
         elif x < self.np - 1:
             if y + 1 < self.nc:
-                next_nodes.append((x + 1, y + 1))
-            next_nodes.append((x + 1, y))
+                next_nodes.append(Action((x + 1, y + 1)))
+            next_nodes.append(Action((x + 1, y)))
             if y > 0:
-                next_nodes.append((x + 1, y - 1))
+                next_nodes.append(Action((x + 1, y - 1)))
 
-        return ListSpace([next_nodes])
+        return ListSpace(next_nodes)
 
     def _get_action_space_(self) -> Space[D.T_event]:
         """
         Define action space.
         """
-        return EnumSpace(Action)
+        return ImplicitSpace(lambda x: isinstance(x, State))
 
     def _get_observation_space_(self) -> Space[D.T_observation]:
         """
@@ -275,12 +278,12 @@ class FlightPlanningDomain(D):
         fig.set_dpi(1)
         fig.set_figwidth(600)
         fig.set_figheight(600)
-        if image is None:
-            image = ax.imshow(image_data)
-        else:
-            image.set_data(image_data)
-            image.figure.canvas.draw()
-        return ax, image
+        # if image is None:
+        #     image = ax.imshow(image_data)
+        # else:
+        #     image.set_data(image_data)
+        #     image.figure.canvas.draw()
+        return ax, None
 
     def heuristic(self, s: D.T_state) -> Value[D.T_value]:
         """Heuristic to be used by search algorithms.
@@ -289,80 +292,6 @@ class FlightPlanningDomain(D):
 
         """
         return Value(cost=0)
-
-    # def get_initial_state(self):
-    #     return State(self.dfcl, (0, 0))
-
-    # def is_terminal_state(self, state: State) -> bool:
-    #     # Did we reach the end of the graph?
-    #     return state.pos[0] == self.np - 1
-
-    # def get_next_available_actions(self, current_state: State) -> List[State]:
-    #     # x0, y0 = self.initial_state.node_id
-    #     # x1, y1 = self.final_state.node_id
-
-    #     x, y = current_state.pos
-
-    #     if self.is_terminal_state(current_state):
-    #         print("We are done !!!")
-    #         return []
-
-    #     next_nodes = []
-    #     if x == 0:
-    #         for j in range(self.nc):
-    #             next_nodes.append((x + 1, j))
-    #     else:
-    #         if y + 1 < self.nc:
-    #             next_nodes.append((x + 1, y + 1))
-    #         next_nodes.append((x + 1, y))
-    #         if y > 0:
-    #             next_nodes.append((x + 1, y - 1))
-
-    #     next_actions = []
-    #     tick = time()
-    #     for node in next_nodes:
-    #         # Set the initial conditions of the new cruise leg
-    #         self.cruise.initial_mass = current_state.trajectory.mass.iloc[-1]
-    #         self.cruise.lat1 = current_state.trajectory.lat.iloc[-1]
-    #         self.cruise.lon1 = current_state.trajectory.lon.iloc[-1]
-    #         # Extract current time to set wind conditions
-    #         ts = current_state.trajectory.ts.iloc[-1]
-    #         # Update wind information
-    #         # self.cruise.wind =
-    #         # Set destination point
-    #         self.cruise.lat2 = self.network[node[0]][node[1]].lat
-    #         self.cruise.lon2 = self.network[node[0]][node[1]].lon
-    #         # Set number of points
-    #         self.cruise.setup_dc(nodes=20)
-    #         # Compute the optimal trajectory
-    #         dfcr = self.cruise.trajectory(self.objective[1])
-    #         next_actions.append(State(dfcr, node))
-
-    #     print(f"Time to compute next actions: {time() - tick}")
-
-    #     return next_actions
-
-    # def get_next_state(self, current_state: State, current_action: Action) -> State:
-    #     current_action.trajectory.ts = (
-    #         current_state.trajectory.ts.iloc[-1] + current_action.trajectory.ts
-    #     )
-    #     state = State(
-    #         pd.concat(
-    #             [current_state.trajectory, current_action.trajectory], ignore_index=True
-    #         ),
-    #         current_action.pos,
-    #     )
-    #     return state
-
-    # def get_best_action(self, actions: List[Action]) -> Action:
-    #     best_action = actions[0]
-    #     best_objective = sys.float_info.max
-    #     for action in actions:
-    #         if action.trajectory[self.objective[1]].iloc[-1] <= best_objective:
-    #             best_objective = action.trajectory[self.objective[1]].iloc[-1]
-    #             best_action = action
-
-    #     return best_action
 
     def get_network(self, p0: LatLon, p1: LatLon, np: int, nc: int):
         np2 = np // 2
@@ -433,11 +362,20 @@ class FlightPlanningDomain(D):
 if __name__ == "__main__":
     # Initialize the environment
 
+    logger = logging.getLogger()
+    fhandler = TimedRotatingFileHandler(f"{__name__}.log", when="midnight")
+    formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
+    fhandler.setFormatter(formatter)
+    logger.addHandler(fhandler)
+    logger.setLevel(logging.INFO)
+
     origin = "LFPG"
     destination = "WSSS"
     #
-    fgrib = "data/adaptor.mars.internal-1660049600.592577-31348-4-6fc2ef7e-de0a-4dcb-9a4e-6d61345f126f.grib"
+    tick = time()
+    fgrib = "data/adaptor.mars.internal-1659588957.360821-19344-9-b2135488-9725-486e-b3d2-adf40cb68242.grib"
     windfield = wind.read_grib(fgrib)
+    logging.info(f"Wind field read in {time() - tick:.2f} seconds")
 
     # Flying from LFBO to LFPO (see http://rfinder.asalink.net/free/)
     # ID      FREQ   TRK   DIST   Coords                       Name/Remarks
@@ -471,10 +409,19 @@ if __name__ == "__main__":
         "LFPG", "WSSS", "A388", windfield=windfield
     )
 
+    logging.info("Creating domain")
     domain = domain_factory()
 
-    match_solvers(domain=domain)
+    logging.info("Looking for compatible solvers")
+    candidate_solvers = match_solvers(domain=domain)
+    logging.info("Found {} compatible solvers".format(len(candidate_solvers)))
+    for solver in candidate_solvers:
+        logging.info(solver)
 
     solver = Astar(heuristic=lambda d, s: d.heuristic(s))
+    from skdecide.utils import rollout_episode
 
-    FlightPlanningDomain.solve_with(solver, domain_factory)
+    a = rollout_episode(domain, from_memory=domain.get_initial_state())
+    logging.info(a)
+
+    # FlightPlanningDomain.solve_with(solver, domain_factory)
