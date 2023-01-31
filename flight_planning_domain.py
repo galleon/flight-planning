@@ -3,25 +3,31 @@ import os
 import sys
 import warnings
 from argparse import Action
+from datetime import datetime, timedelta
 from enum import Enum
 from logging.handlers import TimedRotatingFileHandler
 from math import pi
 from time import sleep, time
 from typing import Any, List, NamedTuple, Optional, Tuple, Union
 
-import numpy as np
+from flightplanning_utils import (
+    WeatherRetrieverFromEcmwf,
+    WindInterpolator,
+    WindInterpolator_,
+)
+
 import matplotlib.pyplot as plt
+import numpy as np
 import openap
 import openap.casadi as oc
 import pandas as pd
 from cartopy import crs as ccrs
 from cartopy.feature import BORDERS, LAND, OCEAN
 from matplotlib.figure import Figure
-from openap.top import Climb, Cruise, Descent, wind
-from openap.top.full import MultiPhase
 from openap import aero
+from openap.top import Climb, Cruise, Descent
 from pygeodesy.ellipsoidalVincenty import LatLon
-from skdecide import DeterministicPlanningDomain, ImplicitSpace, Solver, Space, Value
+from skdecide import DeterministicPlanningDomain, Space, Value
 from skdecide.builders.domain import Actions, Renderable, UnrestrictedActions
 from skdecide.hub.solver.astar import Astar
 from skdecide.hub.solver.stable_baselines import StableBaseline
@@ -78,7 +84,7 @@ class FlightPlanningDomain(D):
         destination: Union[str, tuple],
         actype: str,
         m0: float = 0.8,
-        windfield: pd.DataFrame = None,
+        wind_interpolator: WindInterpolator = None,
         objective: Union[str, tuple] = "fuel",
     ):
         """A simple class to compute a flight plan.
@@ -122,31 +128,19 @@ class FlightPlanningDomain(D):
         self.climb = Climb(actype, origin, destination, m0)
         self.descent = Descent(actype, origin, destination, m0)
 
-        self.windfield = windfield
+        self.wind_interpolator = wind_interpolator
 
-        if windfield is not None:
-            w = wind.PolyWind(
-                windfield,
-                self.cruise.proj,
-                self.lat1,
-                self.lon1,
-                self.lat2,
-                self.lon2,
-            )
-            self.cruise.wind = w
-            self.climb.wind = w
-            self.descent.wind = w
+        if self.wind_interpolator is not None:
+            ts = 0.0  # could be set to an offset
+            windfield: pd.DataFrame = self.wind_interpolator.get_windfield(ts)
+            self.cruise.enable_wind(windfield)
+            self.climb.enable_wind(windfield)
+            self.descent.enable_wind(windfield)
 
         # Find the approximate cruise altitude
         tick = time()
         dfcr = self.cruise.trajectory(self.objective[1])
         logging.info(f"Cruise trajectory computed in {time() - tick:.2f} seconds")
-
-        # Run multiphase flight
-        # tick = time()
-        # dfmp = self.multiphase.trajectory(self.objective)
-        # logging.info(f"Multiphase trajectory computed in {time() - tick:.2f} seconds")
-        # dfmp.to_csv(f"multiphase_{origin}_{destination}.csv")
 
         # Find optimal climb trajectory
         # tick = time()
@@ -184,7 +178,11 @@ class FlightPlanningDomain(D):
         # Extract current time to set wind conditions
         ts = trajectory.ts.iloc[-1]
         # Update wind information
-        # self.cruise.wind =
+        if self.wind_interpolator is not None:
+            windfield: pd.DataFrame = self.wind_interpolator.get_windfield(ts)
+            self.cruise.enable_wind(windfield)
+            self.climb.enable_wind(windfield)
+            self.descent.enable_wind(windfield)
 
         # Set intermediate destination point
         next_x, next_y = memory.pos
@@ -330,29 +328,21 @@ class FlightPlanningDomain(D):
         ax.gridlines(draw_labels=True, color="gray", alpha=0.5, ls="--")
         ax.coastlines(resolution="50m", lw=0.5, color="gray")
 
-        if self.windfield is not None:
-            # get the closed altitude
-            h_max = memory.trajectory.alt.max() * aero.ft
-            fl = int(round(h_max / aero.ft / 100, -1))
-            idx = np.argmin(abs(windfield.h.unique() - h_max))
-            df_wind = (
-                self.windfield.query(f"h=={self.windfield.h.unique()[idx]}")
-                .query(f"longitude <= {lonmax + 2}")
-                .query(f"longitude >= {lonmin - 2}")
-                .query(f"latitude <= {latmax + 2}")
-                .query(f"latitude >= {latmin - 2}")
-            )
-
-            ax.barbs(
-                df_wind.longitude.values[::wind_sample],
-                df_wind.latitude.values[::wind_sample],
-                df_wind.u.values[::wind_sample],
-                df_wind.v.values[::wind_sample],
-                transform=ccrs.PlateCarree(),
-                color="k",
-                length=5,
-                lw=0.5,
-                label=f"Wind FL{fl}",
+        if self.wind_interpolator is not None:
+            t = memory.trajectory.ts.iloc[-1]
+            alt = memory.trajectory.alt.iloc[-1]
+            self.wind_interpolator.plot_wind(
+                alt=alt,
+                lon_min=max(-180, lonmin - 4),
+                lon_max=min(+180, lonmax + 4),
+                lat_min=max(-90, latmin - 2),
+                lat_max=min(+90, latmax + 2),
+                t=int(t),
+                n_lat=180,
+                n_lon=720,
+                plot_wind=False,
+                plot_barbs=False,
+                ax=ax,
             )
 
         # great circle
@@ -483,9 +473,13 @@ if __name__ == "__main__":
     destination = "WSSS"
     #
     tick = time()
-    fgrib = "data/adaptor.mars.internal-1659588957.360821-19344-9-b2135488-9725-486e-b3d2-adf40cb68242.grib"
-    windfield = wind.read_grib(fgrib)
+    # dt = datetime.now() - timedelta(days=7)
+    # file = WeatherRetrieverFromEcmwf().get(dt)
+    fgrib = "data/tmp0223m9wc.grib"
+    wind_interpolator = WindInterpolator_(fgrib)
     logging.info(f"Wind field read in {time() - tick:.2f} seconds")
+
+    # wind_interpolator.plot_wind(alt=30000, t=[0, 3600, 7200, 10800, 14400, 18000])
 
     # Flying from LFBO to LFPO (see http://rfinder.asalink.net/free/)
     # ID      FREQ   TRK   DIST   Coords                       Name/Remarks
@@ -519,7 +513,7 @@ if __name__ == "__main__":
     max_steps = 100
 
     domain_factory = lambda: FlightPlanningDomain(
-        "LFPG", "WSSS", "A388", windfield=windfield
+        "LFPG", "WSSS", "A388", wind_interpolator=wind_interpolator
     )
 
     logging.info("Creating domain")
