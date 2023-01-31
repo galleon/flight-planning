@@ -1,8 +1,8 @@
 import time
 from datetime import datetime, timedelta
+from math import asin, atan2, cos, degrees, radians, sin, sqrt
 from tempfile import NamedTemporaryFile
 from typing import Callable, Collection, Iterable, Tuple, Union
-from math import atan2, degrees, radians, cos, sin, asin, sqrt
 
 import cdsapi
 import cfgrib

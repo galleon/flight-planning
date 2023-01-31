@@ -13,7 +13,8 @@ from typing import Any, List, NamedTuple, Optional, Tuple, Union
 from flightplanning_utils import (
     WeatherRetrieverFromEcmwf,
     WindInterpolator,
-    WindInterpolator_,
+    flying,
+    plot_trajectory,
 )
 
 import matplotlib.pyplot as plt
@@ -476,7 +477,7 @@ if __name__ == "__main__":
     # dt = datetime.now() - timedelta(days=7)
     # file = WeatherRetrieverFromEcmwf().get(dt)
     fgrib = "data/tmp0223m9wc.grib"
-    wind_interpolator = WindInterpolator_(fgrib)
+    wind_interpolator = WindInterpolator(fgrib)
     logging.info(f"Wind field read in {time() - tick:.2f} seconds")
 
     # wind_interpolator.plot_wind(alt=30000, t=[0, 3600, 7200, 10800, 14400, 18000])
