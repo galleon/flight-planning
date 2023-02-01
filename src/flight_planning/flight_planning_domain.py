@@ -1,48 +1,39 @@
-import logging
-import os
-import sys
 import warnings
 from argparse import Action
 from datetime import datetime, timedelta
 from enum import Enum
-from logging.handlers import TimedRotatingFileHandler
-from math import pi
-from time import sleep, time
-from typing import Any, List, NamedTuple, Optional, Tuple, Union
+from time import sleep
+from typing import Any, NamedTuple, Optional, Tuple, Union
 
 import matplotlib.pyplot as plt
-import numpy as np
 import pandas as pd
-from cartopy import crs as ccrs
-from cartopy.feature import BORDERS, LAND, OCEAN
+import xarray as xr
 from flightplanning_utils import (
     WeatherRetrieverFromEcmwf,
     WindInterpolator,
     flying,
     plot_trajectory,
 )
-from matplotlib.figure import Figure
+from IPython.display import clear_output
 from openap.extra.aero import distance
 from openap.extra.nav import airport
 from openap.fuel import FuelFlow
 from openap.prop import aircraft
 from pygeodesy.ellipsoidalVincenty import LatLon
-from skdecide import DeterministicPlanningDomain, Space, Value
-from skdecide.builders.domain import Actions, Renderable, UnrestrictedActions
+from skdecide import DeterministicPlanningDomain, Domain, Space, Value
+from skdecide.builders.domain import Renderable, UnrestrictedActions
 from skdecide.hub.solver.astar import Astar
-from skdecide.hub.solver.stable_baselines import StableBaseline
 from skdecide.hub.space.gym import EnumSpace, ListSpace, MultiDiscreteSpace
 from skdecide.utils import match_solvers
 
-# from openap.top import Climb, Cruise, Descent
 
-
-warnings.filterwarnings("ignore")
-
-
-class State(NamedTuple):
+class State:
     trajectory: pd.DataFrame
     pos: Tuple[int, int]
+
+    def __init__(self, trajectory, pos):
+        self.trajectory = trajectory
+        self.pos = pos
 
     def __hash__(self):
         return hash(self.pos)
@@ -57,17 +48,13 @@ class State(NamedTuple):
         return f"[{self.trajectory.iloc[-1]['ts']:.2f} \
             {self.pos} \
             {self.trajectory.iloc[-1]['alt']:.2f} \
-            {self.trajectory.iloc[-1]['fuel']:.2f}]"
+            {self.trajectory.iloc[-1]['mass']:.2f}]"
 
 
 class Action(Enum):
     up = -1
     straight = 0
     down = 1
-
-
-# class D(DeterministicPlanningDomain, Actions, Renderable):
-# because of `Actions`need to implement _get_applicable_actions_from
 
 
 class D(DeterministicPlanningDomain, UnrestrictedActions, Renderable):
@@ -80,7 +67,17 @@ class D(DeterministicPlanningDomain, UnrestrictedActions, Renderable):
     T_agent = Union  # Type of agent
 
 
-class FlightPlanningDomain(D):
+class FlightPlanningDomain(
+    DeterministicPlanningDomain, UnrestrictedActions, Renderable
+):
+    T_state = State  # Type of states
+    T_observation = State  # Type of observations
+    T_event = Action  # Type of events
+    T_value = float  # Type of transition values (rewards or costs)
+    T_predicate = bool  # Type of transition predicates (terminal states)
+    T_info = None  # Type of additional information in environment outcome
+    T_agent = Union  # Type of agent
+
     def __init__(
         self,
         origin: Union[str, tuple],
@@ -89,6 +86,8 @@ class FlightPlanningDomain(D):
         m0: float = 0.8,
         wind_interpolator: WindInterpolator = None,
         objective: Union[str, tuple] = "fuel",
+        nb_points_forward: int = 41,
+        nb_points_lateral: int = 11,
     ):
         """A simple class to compute a flight plan.
 
@@ -106,6 +105,7 @@ class FlightPlanningDomain(D):
             The objective of the flight. Defaults to "fuel".
             for climb, cruise and descent.
         """
+
         if isinstance(origin, str):
             ap1 = airport(origin)
             self.lat1, self.lon1 = ap1["lat"], ap1["lon"]
@@ -125,8 +125,8 @@ class FlightPlanningDomain(D):
             self.wind_ds = wind_interpolator.get_dataset()
 
         # Build network between top of climb and destination airport
-        self.np: int = 41
-        self.nc: int = 11
+        self.np: int = nb_points_forward
+        self.nc: int = nb_points_lateral
         self.network = self.get_network(
             LatLon(self.lat1, self.lon1),
             LatLon(self.lat2, self.lon2),
@@ -151,7 +151,6 @@ class FlightPlanningDomain(D):
             ),
             (0, self.nc // 2),
         )
-
         self.fuel_flow = FuelFlow(actype).enroute
 
     def _get_next_state(self, memory: D.T_state, action: D.T_event) -> D.T_state:
@@ -160,6 +159,7 @@ class FlightPlanningDomain(D):
           - memory: the current state
           - action: the action to take
         """
+
         trajectory = memory.trajectory.copy()
 
         # Set intermediate destination point
@@ -203,14 +203,24 @@ class FlightPlanningDomain(D):
         """
 
         assert memory != next_state, "Next state is the same as the current state"
-
-        cost = distance(
-            memory.trajectory.tail(1)["lat"],
-            memory.trajectory.tail(1)["lon"],
-            next_state.trajectory.iloc[-1]["lat"],
-            next_state.trajectory.iloc[-1]["lon"],
-        )
-
+        # Have to change -> openAP top ?
+        if self.objective == "distance":
+            cost = distance(
+                memory.trajectory.iloc[-1]["lat"],
+                memory.trajectory.iloc[-1]["lon"],
+                next_state.trajectory.iloc[-1]["lat"],
+                next_state.trajectory.iloc[-1]["lon"],
+            )
+        elif self.objective == "fuel":
+            cost = (
+                memory.trajectory.iloc[-1]["mass"]
+                - next_state.trajectory.iloc[-1]["mass"]
+            )
+        elif self.objective == "time":
+            cost = (
+                next_state.trajectory.iloc[-1]["mass"]
+                - memory.trajectory.iloc[-1]["ts"]
+            )
         # return Value(cost=1)
         return Value(cost=cost)
 
@@ -356,117 +366,3 @@ class FlightPlanningDomain(D):
                     total_distance / (np2 - i + 1), bearing
                 )
         return pt
-
-
-if __name__ == "__main__":
-    # Initialize the environment
-
-    logger = logging.getLogger()
-    fhandler = TimedRotatingFileHandler(f"{__name__}.log", when="midnight")
-    formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
-    fhandler.setFormatter(formatter)
-    logger.addHandler(fhandler)
-    logger.setLevel(logging.INFO)
-
-    origin = "LFPG"
-    destination = "WSSS"
-    #
-    tick = time()
-    # dt = datetime.now() - timedelta(days=7)
-    # file = WeatherRetrieverFromEcmwf().get(dt)
-    fgrib = "data/tmp0223m9wc.grib"
-    wind_interpolator = WindInterpolator(fgrib)
-    logging.info(f"Wind field read in {time() - tick:.2f} seconds")
-
-    # wind_interpolator.plot_wind(alt=30000, t=[0, 3600, 7200, 10800, 14400, 18000])
-
-    # Flying from LFBO to LFPO (see http://rfinder.asalink.net/free/)
-    # ID      FREQ   TRK   DIST   Coords                       Name/Remarks
-    # LFBO             0      0   N43°38'06.46" E001°22'04.28" TOULOUSE BLAGNAC
-    # FISTO          353     50   N44°27'41.00" E001°13'37.99" FISTO
-    # LMG     114.5  354     82   N45°48'56.99" E001°01'31.99" LIMOGES
-    # BEVOL          356     72   N47°00'43.00" E000°55'50.99" BEVOL
-    # AMB     106.3   11     26   N47°25'44.00" E001°03'52.00" AMBOISE
-    # LFPO            33     94   N48°43'23.81" E002°22'46.48" PARIS ORLY
-
-    # Initialize the planning domain
-
-    # A380-841
-    # Departure: LFPG (N49° 00' 36", E2° 32' 55")
-    # Arrival: KJFK (N40° 38' 26", W73° 46' 44")
-    # 10 June 2017 Wind NOAA Nowcast - delta_time: 0.1 hour
-    # Altitude: 35000 ft
-    # Mach: 0.86
-    # Time: 0
-    # Bank: 0
-    # Track: 0
-    # Mass: mass_properties.OEW + 50000 + 76300 + (i-2)*1000 for i in range(5)
-    # {}
-    # fuel_mass = mass_properties.OEW
-    # empty_mass = 50000
-    # payload_mass = 76300 + (i-2)*1000 for i in range(5)
-
-    # Heuristiques ? fuel = distance_restante_grand_cercle * mean_consumption_fuel
-
-    pause_between_steps = None
-    max_steps = 100
-
-    domain_factory = lambda: FlightPlanningDomain(
-        "LFPG", "WSSS", "A388", wind_interpolator=wind_interpolator
-    )
-
-    logging.info("Creating domain")
-    domain = domain_factory()
-
-    logging.info("Looking for compatible solvers")
-    candidate_solvers = match_solvers(domain=domain)
-    logging.info("Found {} compatible solvers".format(len(candidate_solvers)))
-    for solver in candidate_solvers:
-        logging.info(solver)
-
-    solver = Astar(heuristic=lambda d, s: d.heuristic(s))
-
-    tick = time()
-    FlightPlanningDomain.solve_with(solver, domain_factory)
-    logging.info(f"Solved in {time() - tick:.2f} seconds")
-
-    solver.reset()
-    observation = domain.reset()
-
-    logging.info("Starting planning")
-    logging.info(observation)
-
-    # Initialize image
-    figure = domain.render(observation)
-    # display(figure)
-    plt.draw()
-    plt.pause(0.001)
-
-    # loop until max_steps or goal is reached
-    for i_step in range(1, max_steps + 1):
-        if pause_between_steps is not None:
-            sleep(pause_between_steps)
-
-        # choose action according to solver
-        action = solver.sample_action(observation)
-        # get corresponding action
-        outcome = domain.step(action)
-        observation = outcome.observation
-
-        # update image
-        figure = domain.render(observation)
-        # clear_output(wait=True)
-        # display(figure)
-        plt.draw()
-        plt.pause(0.001)
-
-        # final state reached?
-        if domain.is_terminal(observation):
-            break
-
-    # goal reached?
-    is_goal_reached = domain.is_goal(observation)
-    if is_goal_reached:
-        logging.info(f"Goal reached in {i_step} steps!")
-    else:
-        logging.info(f"Goal not reached after {i_step} steps!")

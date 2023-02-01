@@ -1,3 +1,7 @@
+# Copyright (c) AIRBUS and its affiliates.
+# This source code is licensed under the MIT license found in the
+# LICENSE file in the root directory of this source tree.
+
 import time
 from datetime import datetime, timedelta
 from math import asin, atan2, cos, degrees, radians, sin, sqrt
@@ -274,7 +278,7 @@ class WindInterpolator:
 
             # if plot_wind:
             #     q.remove()
-
+        plt.savefig("wind")
         return ax
 
 
@@ -296,22 +300,17 @@ def flying(
 
     dist_ = aero.distance(pos["lat"], pos["lon"], to_[0], to_[1], pos["alt"])
     data = []
-
-    epsilon = 1_000
+    epsilon = 100
     dt = 600
-
     dist = dist_
-
     loop = 0
     while dist > epsilon:  # or loop < 20 or dt > 0:
         bearing = aero.bearing(pos["lat"], pos["lon"], to_[0], to_[1])
-
         p, _, _ = aero.atmos(pos["alt"] * aero.ft)
         isobaric = p / 100
-
         we, wn = 0, 0
         if ds:
-            time = ds.time[0] + np.timedelta64(pos["ts"], "s")
+            time = ds.time[0] + np.timedelta64(int(pos["ts"]), "s")
 
             wind_ms = ds.interp(
                 latitude=pos["lat"],
@@ -320,7 +319,10 @@ def flying(
                 isobaricInhPa=isobaric,
             )
             we, wn = wind_ms.u.values, wind_ms.v.values  # 0, 300
-
+        if np.isnan(wn):
+            wn = 0.0
+        if np.isnan(we):
+            we = 0.0
         wdir = (degrees(atan2(we, wn)) + 180) % 360
         wspd = sqrt(wn * wn + we * we)
 
@@ -339,11 +341,15 @@ def flying(
         gsn = tas * cos(radians(heading)) - wn
         gse = tas * sin(radians(heading)) - we
 
-        gs = sqrt(gsn * gsn + gse * gse)
-
-        brg = degrees(atan2(gse, gsn)) % 360.0
-
-        ll = aero.latlon(pos["lat"], pos["lon"], gs * dt, brg, pos["alt"])
+        gs = sqrt(gsn * gsn + gse * gse)  # ground speed
+        print("gs : %f  we : %f wn : %f tas : %f" % (gs, we, wn, tas))
+        if gs * dt > dist:
+            # Last step. make sure we go to destination.
+            dt = dist / gs
+            ll = to_[0], to_[1]
+        else:
+            brg = degrees(atan2(gse, gsn)) % 360.0
+            ll = aero.latlon(pos["lat"], pos["lon"], gs * dt, brg, pos["alt"])
         pos["fuel"] = dt * fflow(
             pos["mass"], tas / aero.kts, pos["alt"] * aero.ft, path_angle=0.0
         )
@@ -359,17 +365,20 @@ def flying(
             "alt": pos["alt"],
         }
 
+        # New distance to the next 'checkpoint'
         dist = aero.distance(
             new_row["lat"], new_row["lon"], to_[0], to_[1], new_row["alt"]
         )
 
+        # print("Dist : %f Dist_ : %f " %(dist,dist_))
         if dist < dist_:
+            # print("Fuel new_row : %f" %new_row["fuel"])
             data.append(new_row)
             dist_ = dist
-
             pos = data[-1]
         else:
             dt = int(dt / 10)
+            print("going in the wrong part.")
             assert dt > 0
 
         loop += 1
